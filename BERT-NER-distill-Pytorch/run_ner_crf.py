@@ -16,9 +16,9 @@ from callback.progressbar import ProgressBar
 from tools.common import seed_everything,json_to_text
 from tools.common import init_logger, logger
 from torch.utils.tensorboard import SummaryWriter
-
+from torch.utils.data.dataset import Dataset
 from transformers import WEIGHTS_NAME, BertConfig,get_linear_schedule_with_warmup,AdamW, BertTokenizer
-from models.bert_for_ner import BertCrfForNer, IDCNNCrfForNer, BilstmCrfForNer
+from models.bert_for_ner import BertCrfForNer
 from processors.utils_ner import get_entities, get_conll_out_format
 from processors.ner_seq import convert_examples_to_features
 from processors.ner_seq import ner_processors as processors
@@ -29,9 +29,54 @@ from losses.ce_loss import CELoss, KLLoss
 MODEL_CLASSES = {
     ## bert ernie bert_wwm bert_wwwm_ext
     'bert': (BertConfig, BertCrfForNer, BertTokenizer),
-    'idcnn':(BertConfig, IDCNNCrfForNer, BertTokenizer),
-    'bilstm': (BertConfig, BilstmCrfForNer, BertTokenizer),
 }
+
+from seqeval.metrics import f1_score, precision_score, recall_score, classification_report
+
+def compute_metrics(predictions, label_ids, label_map):
+    label_list = [[label_map[x] for x in seq] for seq in label_ids]
+    preds_list = [[label_map[x]  if label_map[x] != "X" else "O" for x in seq] for seq in predictions]
+    class_info = classification_report(label_list, preds_list, digits=4, output_dict=True)
+    return {
+        "precision": precision_score(label_list, preds_list),
+        "recall": recall_score(label_list, preds_list),
+        "f1": f1_score(label_list, preds_list),
+    }, class_info
+
+
+def write_predictions(input_file, output_file, predictions):
+    """ Write Product Extraction predictions to file,
+        while aligning with the input format.
+    """
+    with open(output_file, "w") as writer, open(input_file, "r") as f:
+        example_id = 0
+        for line in f:
+            if line.startswith("#\tpassage"):
+                writer.write(line)
+            elif line == "" or line == "\n":
+                writer.write(line)
+                if not predictions[example_id]:
+                    example_id += 1
+            elif len(predictions) > example_id:
+                cols = line.rstrip().split()
+                if len(predictions[example_id]) == 0:
+                    cols.append("O")
+                else:
+                    if type(predictions[example_id][0]) == list:
+                        if len(predictions[example_id][0]) == 0:
+                            cols.append("O")
+                        else:
+                            cols.extend(predictions[example_id].pop(0))
+                    else:
+                        label = predictions[example_id].pop(0)
+                        if label == "X":
+                            label = "O"
+                        cols.append(label)
+                writer.write("\t".join(cols) + "\n")
+            else:
+                logger.warning(
+                    "Maximum sequence length exceeded: No prediction for '%s'.", line.split()[0]
+                )
 
 def train(args, train_dataset, eval_dataset, model, tokenizer):
     """ Train the model """
@@ -46,12 +91,25 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
         t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ["bias", "LayerNorm.weight"]
-    param_optimizer = list(model.named_parameters())
+    crf_param_optimizer = list(model.crf.named_parameters())
+    linear_param_optimizer = list(model.classifier.named_parameters())
+    bert_param_optimizer = [item for item in list(model.named_parameters()) \
+                            if not item[0].startswith("crf")  and not item[0].startswith("classifier")]
     optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+        {'params': [p for n, p in bert_param_optimizer if not any(nd in n for nd in no_decay)],
          'weight_decay': args.weight_decay, 'lr': args.learning_rate},
-        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0,
+        {'params': [p for n, p in bert_param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0,
          'lr': args.learning_rate},
+
+        {'params': [p for n, p in crf_param_optimizer if not any(nd in n for nd in no_decay)],
+         'weight_decay': args.weight_decay, 'lr': args.crf_learning_rate},
+        {'params': [p for n, p in crf_param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0,
+         'lr': args.crf_learning_rate},
+
+        {'params': [p for n, p in linear_param_optimizer if not any(nd in n for nd in no_decay)],
+         'weight_decay': args.weight_decay, 'lr': args.crf_learning_rate},
+        {'params': [p for n, p in linear_param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0,
+         'lr': args.crf_learning_rate}
     ]
     args.warmup_steps = int(t_total * args.warmup_proportion)
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
@@ -121,17 +179,13 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                 continue
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
-            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "dependency_mask":batch[3], "labels": batch[4]}
             if args.model_type != "distilbert":
                 # XLM and RoBERTa don"t use segment_ids
                 inputs["token_type_ids"] = (batch[2] if args.model_type in ["bert", "xlnet"] else None)
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
             #student model need add loss function like Lseq-fuzzy
-            if args.train_type == "student":
-                teacher_logit = batch[-1]
-                ce_loss = KLLoss()(outputs[1], teacher_logit)
-                loss += ce_loss
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
             if args.gradient_accumulation_steps > 1:
@@ -153,27 +207,7 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                 scheduler.step()  # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
-                # if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                #     # Log metrics
-                #     print(" ")
-                #     if args.local_rank == -1:
-                #         # Only evaluate when single GPU otherwise metrics may not average well
-                #         evaluate(args, model, tokenizer)
-                # if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-                #     # Save model checkpoint
-                #     output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
-                #     if not os.path.exists(output_dir):
-                #         os.makedirs(output_dir)
-                #     model_to_save = (
-                #         model.module if hasattr(model, "module") else model
-                #     )  # Take care of distributed/parallel training
-                #     model_to_save.save_pretrained(output_dir)
-                #     torch.save(args, os.path.join(output_dir, "training_args.bin"))
-                #     logger.info("Saving model checkpoint to %s", output_dir)
-                #     tokenizer.save_vocabulary(output_dir)
-                #     # torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                #     torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
-                #     logger.info("Saving optimizer and scheduler states to %s", output_dir)
+
         #evaluate for every epoch, and save best f1 model on dev
         results = evaluate(args, model, eval_dataset, epoch)
         writer.add_scalar('eval/loss', results["loss"], epoch)
@@ -200,15 +234,12 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
 
 
 def evaluate(args, model, eval_dataset, prefix):
-    metric = SeqEntityScore(args.id2label, markup=args.markup)
     eval_output_dir = args.output_dir
     if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
         os.makedirs(eval_output_dir)
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
     # Note that DistributedSampler samples randomly
     eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
-    if args.train_type == "student":
-        eval_dataset.tensors = eval_dataset.tensors[:3] + (torch.tensor([args.train_max_seq_length] * eval_dataset.tensors[0].shape[0]), eval_dataset.tensors[-1])
     eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size,
                                  collate_fn=collate_fn)
     # Eval!
@@ -217,6 +248,8 @@ def evaluate(args, model, eval_dataset, prefix):
     logger.info("  Batch size = %d", args.eval_batch_size)
     eval_loss = 0.0
     nb_eval_steps = 0
+    all_pred_id_ls = []
+    all_label_id_ls = []
     pbar = ProgressBar(n_total=len(eval_dataloader), desc="Evaluating")
     if isinstance(model, nn.DataParallel):
         model = model.module
@@ -224,45 +257,46 @@ def evaluate(args, model, eval_dataset, prefix):
         model.eval()
         batch = tuple(t.to(args.device) for t in batch)
         with torch.no_grad():
-            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "dependency_mask":batch[3], "labels": batch[4]}
             if args.model_type != "distilbert":
                 # XLM and RoBERTa don"t use segment_ids
                 inputs["token_type_ids"] = (batch[2] if args.model_type in ["bert", "xlnet"] else None)
             outputs = model(**inputs)
             tmp_eval_loss, logits = outputs[:2]
-            tags = model.crf.decode(logits, inputs['attention_mask'])
+            tags = model.decode(logits, inputs['attention_mask'], batch[-1])
         if args.n_gpu > 1:
             tmp_eval_loss = tmp_eval_loss.mean()  # mean() to average on multi-gpu parallel evaluating
         eval_loss += tmp_eval_loss.item()
         nb_eval_steps += 1
-        out_label_ids = inputs['labels'].cpu().numpy().tolist()
-        input_lens = batch[4].cpu().numpy().tolist()
-        tags = tags.squeeze(0).cpu().numpy().tolist()
-        for i, label in enumerate(out_label_ids):
-            temp_1 = []
-            temp_2 = []
-            for j, m in enumerate(label):
-                if j == 0:
-                    continue
-                elif j == input_lens[i] - 1:
-                    metric.update(pred_paths=[temp_2], label_paths=[temp_1])
-                    break
-                else:
-                    temp_1.append(args.id2label[out_label_ids[i][j]])
-                    temp_2.append(args.id2label[tags[i][j]])
+        out_label_ids = inputs['labels'].cpu().numpy()
+        out_label_ids = [[out_label_ids[i, j] for j in range(out_label_ids.shape[1]) if batch[-1][i, j] == 1][1:-1] for i in range(out_label_ids.shape[0])]
+        all_label_id_ls.extend(out_label_ids)
+        all_pred_id_ls.extend(tags)
         pbar(step)
+
+    assert len(all_label_id_ls) == len(all_pred_id_ls)
+    assert len(all_label_id_ls[0]) == len(all_label_id_ls[0])
+
+    eval_metric, entity_metric = compute_metrics(all_pred_id_ls, all_label_id_ls, args.id2label)
+
+    # Save predictions
+    write_predictions(
+        os.path.join(args.data_dir, "valid.txt"),
+        os.path.join(args.output_dir, "eval_predictions.txt"),
+        [[args.id2label[x] for x in seq] for seq in all_pred_id_ls]
+    )
+
     logger.info("\n")
     eval_loss = eval_loss / nb_eval_steps
-    eval_info, entity_info = metric.result()
-    results = {f'{key}': value for key, value in eval_info.items()}
+    results = {f'{key}': value for key, value in eval_metric.items()}
     results['loss'] = eval_loss
     logger.info("***** Eval results epoch %s *****", prefix)
     info = "-".join([f' {key}: {value:.4f} ' for key, value in results.items()])
     logger.info(info)
     logger.info("***** Entity results epoch %s *****", prefix)
-    for key in sorted(entity_info.keys()):
+    for key in sorted(entity_metric.keys()):
         logger.info("******* %s results ********" % key)
-        info = "-".join([f' {key}: {value:.4f} ' for key, value in entity_info[key].items()])
+        info = "-".join([f' {key}: {value:.4f} ' for key, value in entity_metric[key].items()])
         logger.info(info)
     return results
 
@@ -274,17 +308,15 @@ def predict(args, model, tokenizer):
     test_dataset = load_and_cache_examples(args, args.task_name, tokenizer, data_type='test')
     # Note that DistributedSampler samples randomly
     test_sampler = SequentialSampler(test_dataset) if args.local_rank == -1 else DistributedSampler(test_dataset)
-    if args.train_type == "student":
-        test_dataset.tensors = test_dataset.tensors[:3] + (torch.tensor([args.train_max_seq_length] * test_dataset.tensors[0].shape[0]), test_dataset.tensors[-1])
-
     test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=1, collate_fn=collate_fn)
     # Eval!
     logger.info("***** Running prediction *****")
     logger.info("  Num examples = %d", len(test_dataset))
     logger.info("  Batch size = %d", 1)
-    results = []
-    conll_results = []
-    output_predict_file = os.path.join(pred_output_dir, "test_prediction.txt")
+    pred_loss = 0.0
+    nb_pred_steps = 0
+    all_pred_id_ls = []
+    all_label_id_ls = []
     pbar = ProgressBar(n_total=len(test_dataloader), desc="Predicting")
 
     if isinstance(model, nn.DataParallel):
@@ -293,54 +325,53 @@ def predict(args, model, tokenizer):
         model.eval()
         batch = tuple(t.to(args.device) for t in batch)
         with torch.no_grad():
-            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": None}
+            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "dependency_mask":batch[3], "labels": batch[4]}
             if args.model_type != "distilbert":
                 # XLM and RoBERTa don"t use segment_ids
                 inputs["token_type_ids"] = (batch[2] if args.model_type in ["bert", "xlnet"] else None)
             outputs = model(**inputs)
-            logits = outputs[0]
-            # save logit of teacher model
-            tags = model.crf.decode(logits, inputs['attention_mask'])
-            tags  = tags.squeeze(0).cpu().numpy().tolist()
-        preds = tags[0][1:-1]  # [CLS]XXXX[SEP]
-        input_tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"].cpu().squeeze(0).numpy())[1:-1]
-        line = get_conll_out_format(input_tokens, preds, args.id2label)
-        label_entities = get_entities(preds, args.id2label, args.markup)
-        json_d = {}
-        json_d['id'] = step
-        json_d['tag_seq'] = " ".join([args.id2label[x] for x in preds])
-        json_d['entities'] = label_entities
-        results.append(json_d)
-        conll_results.append(line)
+            tmp_eval_loss, logits = outputs[:2]
+            tags = model.decode(logits, inputs['attention_mask'], batch[-1])
+        if args.n_gpu > 1:
+            tmp_eval_loss = tmp_eval_loss.mean()  # mean() to average on multi-gpu parallel evaluating
+        pred_loss += tmp_eval_loss.item()
+        nb_pred_steps += 1
+        out_label_ids = inputs['labels'].cpu().numpy()
+        out_label_ids = [[out_label_ids[i, j] for j in range(out_label_ids.shape[1]) if batch[-1][i, j] == 1][1:-1] for i in range(out_label_ids.shape[0])]
+        all_label_id_ls.extend(out_label_ids)
+        all_pred_id_ls.extend(tags)
         pbar(step)
+
+    assert len(all_label_id_ls) == len(all_pred_id_ls)
+    assert len(all_label_id_ls[0]) == len(all_label_id_ls[0])
+
+    eval_metric, entity_metric = compute_metrics(all_pred_id_ls, all_label_id_ls, args.id2label)
+
+    # Save predictions
+    write_predictions(
+        os.path.join(args.data_dir, "test.txt"),
+        os.path.join(args.output_dir, "test_predictions.txt"),
+        [[args.id2label[x] for x in seq] for seq in all_pred_id_ls]
+    )
+
     logger.info("\n")
-    # with open(output_predict_file, "w") as writer:
-    #     for record in results:
-    #         writer.write(json.dumps(record) + '\n')
-    with open(output_predict_file, "w") as writer:
-        for line in conll_results:
-            for token, pred in line:
-                writer.write(token + " " + pred + "\n")
-            writer.write("\n")
+    pred_loss = pred_loss / nb_pred_steps
+    results = {f'{key}': value for key, value in eval_metric.items()}
+    results['loss'] = pred_loss
+    logger.info("***** test results*****")
+    info = "-".join([f' {key}: {value:.4f} ' for key, value in results.items()])
+    logger.info(info)
+    logger.info("***** Entity results*****")
+    for key in sorted(entity_metric.keys()):
+        logger.info("******* %s results ********" % key)
+        info = "-".join([f' {key}: {value:.4f} ' for key, value in entity_metric[key].items()])
+        logger.info(info)
 
 def load_and_cache_examples(args, task, tokenizer, data_type='train'):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
     processor = processors[task]()
     # Load data features from cache or dataset file
-    #student model need load teacher logits
-    if args.train_type == "student" and data_type == 'train':
-        cached_features_file = os.path.join(args.data_dir, 'cached_crf-{}_{}_{}_{}'.format(
-            "teacher",
-            list(filter(None, args.model_name_or_path.split('/'))).pop(),
-            str(args.train_max_seq_length if data_type == 'train' else args.eval_max_seq_length),
-            str(task)))
-        if os.path.exists(cached_features_file) and not args.overwrite_cache:
-            logger.info("Loading features from cached file %s", cached_features_file)
-            dataset = torch.load(cached_features_file)
-            return dataset
-        else:
-            raise IOError("the teacher logit file is not exist: {}".format(cached_features_file))
     cached_features_file = os.path.join(args.data_dir, 'cached_crf-{}_{}_{}_{}'.format(
         data_type,
         list(filter(None, args.model_name_or_path.split('/'))).pop(),
@@ -381,10 +412,12 @@ def load_and_cache_examples(args, task, tokenizer, data_type='train'):
     # Convert to Tensors and build dataset
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
     all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
+    all_input_dependency_mask = torch.tensor([f.input_dependency_mask for f in features], dtype=torch.long)
+    all_decode_mask = torch.tensor([f.decode_mask for f in features], dtype=torch.long)
     all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
     all_label_ids = torch.tensor([f.label_ids for f in features], dtype=torch.long)
     all_lens = torch.tensor([f.input_len for f in features], dtype=torch.long)
-    dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_lens, all_label_ids)
+    dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_input_dependency_mask, all_lens, all_decode_mask, all_label_ids)
     return dataset
 
 
@@ -393,7 +426,7 @@ def main():
 
     if not os.path.exists(args.output_dir):
         os.mkdir(args.output_dir)
-    args.output_dir = args.output_dir + '{}'.format(args.model_type)
+    args.output_dir = args.output_dir + '_{}'.format(args.model_type)
     if not os.path.exists(args.output_dir):
         os.mkdir(args.output_dir)
     time_ = time.strftime("%Y-%m-%d-%H:%M:%S", time.localtime())
@@ -456,22 +489,8 @@ def main():
     config = config_class.from_pretrained(args.model_name_or_path,num_labels=num_labels,)
     tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path,
                                                 do_lower_case=args.do_lower_case,)
-    if args.model_type == "bilstm":
-        config.max_seq_length = args.train_max_seq_length
-        if 'cuda' in str(args.device):
-            state_dict = torch.load(os.path.join(args.model_name_or_path, "pytorch_model.bin"))
-        else:
-            state_dict = torch.load(os.path.join(args.model_name_or_path, "pytorch_model.bin"), map_location="cpu")
-        cache_state_dict = {}
-        for k, v in state_dict.items():
-            if "word_embeddings" in  k or "crf" in k:
-                k = k.replace("bert.embeddings", "bert.embedding")
-                k = k.replace("bert.", "")
-                cache_state_dict[k] = v
-        model = model_class(config=config)
-        model.load_state_dict(cache_state_dict, strict=False)
-    else:
-        model = model_class.from_pretrained(args.model_name_or_path, config=config)
+
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
@@ -484,47 +503,12 @@ def main():
         global_step, tr_loss = train(args, train_dataset, eval_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
-        #save teacher prediction result for student training
-        args.train_type = args.train_type.lower()
-        if args.train_type == "teacher":
-            teacher_logit = []
-            teacher_sampler = SequentialSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(
-                train_dataset)
-            teacher_dataloader = DataLoader(train_dataset, sampler=teacher_sampler, batch_size=1, collate_fn=collate_fn)
-            for step, batch in enumerate(teacher_dataloader):
-                model.eval()
-                batch = tuple(t.to(args.device) for t in batch)
-                with torch.no_grad():
-                    inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": None}
-                    if args.model_type != "distilbert":
-                        # XLM and RoBERTa don"t use segment_ids
-                        inputs["token_type_ids"] = (batch[2] if args.model_type in ["bert", "xlnet"] else None)
-                    outputs = model(**inputs)
-                    logits = outputs[0]
-                    logits = logits.squeeze(0)
-                    if logits.shape[0] < args.train_max_seq_length:
-                        logits = torch.cat([torch.zeros((args.train_max_seq_length - logits.shape[0], logits.shape[1]),  device=args.device), logits], axis=0)
-                    teacher_logit.append(logits.unsqueeze(0))
-
-            teacher_logit = torch.cat(teacher_logit)
-            train_dataset.tensors  += (teacher_logit, )
-            cached_features_file = os.path.join(args.data_dir, 'cached_crf-{}_{}_{}_{}'.format(
-                args.train_type,
-                'best',
-                str(args.train_max_seq_length),
-                str(args.task_name)))
-            if args.local_rank in [-1, 0]:
-                logger.info("Saving teacher features into cached file %s", cached_features_file)
-                torch.save(train_dataset, cached_features_file)
-
 
     if args.do_predict and args.local_rank in [-1, 0]:
         tokenizer = tokenizer_class.from_pretrained(os.path.join(args.output_dir, "best"), do_lower_case=args.do_lower_case)
         model = model_class.from_pretrained(os.path.join(args.output_dir, "best"), config=config)
         model.to(args.device)
         predict(args, model, tokenizer)
-        # test_dataset = load_and_cache_examples(args, args.task_name, tokenizer, data_type='test')
-        # evaluate(args, model, test_dataset, tokenizer)
 
 
 if __name__ == "__main__":

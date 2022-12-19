@@ -5,8 +5,6 @@ def get_argparse():
     # Required parameters
     parser.add_argument("--task_name", default=None, type=str, required=True,
                         help="The name of the task to train selected in the list: ")
-    parser.add_argument("--train_type", default=None, type=str, required=True,
-                        help="The name of the task to train selected in the list: ")
     parser.add_argument("--data_dir", default=None, type=str, required=True,
                         help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.", )
     parser.add_argument("--model_type", default=None, type=str, required=True,
@@ -86,7 +84,7 @@ def get_argparse():
                         help="Overwrite the content of the output directory")
     parser.add_argument("--overwrite_cache", action="store_true",
                         help="Overwrite the cached training and evaluation sets")
-    parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
+    parser.add_argument("--seed", type=int, deoverwritefault=42, help="random seed for initialization")
     parser.add_argument("--fp16", action="store_true",
                         help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit", )
     parser.add_argument("--fp16_opt_level", type=str, default="O1",

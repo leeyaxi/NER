@@ -2,10 +2,27 @@
 import torch
 import logging
 import os
+import time
 import copy
 import json
-from .utils_ner import DataProcessor
+from .utils_ner import DataProcessor, parserDenpendencyTree
+from nltk.parse.stanford import StanfordDependencyParser
+import numpy as np
+import os
+# java_path = "/opt/homebrew/opt/openjdk/bin/java" #write your java path
+# os.environ['JAVAHOME'] = java_path
+
+# stanford_parser_dir = '/Users/fran/Documents/github/NER/BERT-NER-distill-Pytorch/dependency/'
+stanford_parser_dir = './dependency/'
+eng_model_path = stanford_parser_dir + "stanford-corenlp-4.2.0-models-english.jar"
+my_path_to_models_jar = stanford_parser_dir + "stanford-parser-full-2020-11-17/stanford-parser-4.2.0-models.jar"
+my_path_to_jar = stanford_parser_dir + "stanford-parser-full-2020-11-17/stanford-parser.jar"
+
+dependency_parser = StanfordDependencyParser(path_to_models_jar=my_path_to_models_jar,
+                            path_to_jar=my_path_to_jar)
+
 logger = logging.getLogger(__name__)
+
 
 class InputExample(object):
     """A single training/test example for token classification."""
@@ -33,12 +50,14 @@ class InputExample(object):
 
 class InputFeatures(object):
     """A single set of features of data."""
-    def __init__(self, input_ids, input_mask, input_len,segment_ids, label_ids):
+    def __init__(self, input_ids, input_mask, input_dependency_mask, input_len, decode_mask, segment_ids, label_ids):
         self.input_ids = input_ids
         self.input_mask = input_mask
+        self.input_dependency_mask = input_dependency_mask
         self.segment_ids = segment_ids
         self.label_ids = label_ids
         self.input_len = input_len
+        self.decode_mask = decode_mask
 
     def __repr__(self):
         return str(self.to_json_string())
@@ -57,17 +76,15 @@ def collate_fn(batch):
     batch should be a list of (sequence, target, length) tuples...
     Returns a padded tensor of sequences sorted from longest to shortest,
     """
-    try:
-        all_input_ids, all_attention_mask, all_token_type_ids, all_lens, all_labels = map(torch.stack, zip(*batch))
-        max_len = max(all_lens).item()
-        all_input_ids = all_input_ids[:, :max_len]
-        all_attention_mask = all_attention_mask[:, :max_len]
-        all_token_type_ids = all_token_type_ids[:, :max_len]
-        all_labels = all_labels[:,:max_len]
-        return all_input_ids, all_attention_mask, all_token_type_ids, all_labels,all_lens
-    except Exception:
-        all_input_ids, all_attention_mask, all_token_type_ids, all_lens, all_labels, all_teacher_label_logits = map(torch.stack, zip(*batch))
-        return all_input_ids, all_attention_mask, all_token_type_ids, all_labels,all_lens, all_teacher_label_logits
+    all_input_ids, all_attention_mask, all_token_type_ids, all_input_denpency_mask, all_lens, all_decode_mask, all_labels = map(torch.stack, zip(*batch))
+    max_len = max(all_lens).item()
+    all_input_ids = all_input_ids[:, :max_len]
+    all_attention_mask = all_attention_mask[:, :max_len]
+    all_dependency_mask = all_input_denpency_mask[:, :max_len, :max_len]
+    all_token_type_ids = all_token_type_ids[:, :max_len]
+    all_labels = all_labels[:,:max_len]
+    all_deocde_mask = all_decode_mask[:, :max_len]
+    return all_input_ids, all_attention_mask, all_token_type_ids, all_dependency_mask, all_labels, all_lens, all_deocde_mask
 
 def convert_examples_to_features(examples,label_list,max_seq_length,tokenizer,input_type="char",
                                  cls_token_at_end=False,cls_token="[CLS]",cls_token_segment_id=1,
@@ -82,51 +99,43 @@ def convert_examples_to_features(examples,label_list,max_seq_length,tokenizer,in
     label_map = {label: i for i, label in enumerate(label_list)}
     features = []
     for (ex_index, example) in enumerate(examples):
-        if ex_index % 10000 == 0:
+        if ex_index % 50 == 0:
             logger.info("Writing example %d of %d", ex_index, len(examples))
-        if input_type == "word":
-            tokens, label_ids = [], []
-            for word, label  in zip(example.text_a, example.labels):
-                tokenized_word = tokenizer.tokenize(word)
-                if len(tokenized_word) == 0:
-                    continue
-                for token in tokenized_word:
-                    tokens.append(token)
-                label_ids.append(label_map[label])
 
-                for i in range(1, len(tokenized_word)):
-                    label_ids.append(label_map['X'])
+        #get dependency path for example
+        start_time = time.time()
 
-        else:
-            if isinstance(example.text_a,list):
-                example.text_a = " ".join(example.text_a)
-            tokens = tokenizer.tokenize(example.text_a)
-            label_ids = [label_map[x] for x in example.labels]
+        dependency_graph = list(dependency_parser.parse(example.text_a))[0]
+        pdt = parserDenpendencyTree()
+        pdt.find_tree_path(dependency_graph, 0, [])
+        end_time = time.time()
+        # print ("get and calculate dependency path: {:.2f}second".format(end_time - start_time))
+
+        tokens, label_ids = [], []
+        position_mapping_dic = {}
+        abs_pos, rel_pos = 0, 0
+        for word, label  in zip(example.text_a, example.labels):
+            tokenized_word = tokenizer.tokenize(word)
+            rel_move = 1
+            for token in tokenized_word:
+                tokens.append(token)
+            label_ids.append(label_map[label])
+
+            for i in range(1, len(tokenized_word)):
+                rel_move += 1
+                label_ids.append(label_map['X'])
+            position_mapping_dic[abs_pos] = [idx for idx in range(rel_pos, rel_pos+rel_move)]
+            abs_pos += 1
+            rel_pos += rel_move
 
         # Account for [CLS] and [SEP] with "- 2".
         special_tokens_count = 2
+        input_dependency_mask = pdt.get_visual_mask(position_mapping_dic, len(tokens), max_seq_length - special_tokens_count)
+
         if len(tokens) > max_seq_length - special_tokens_count:
             tokens = tokens[: (max_seq_length - special_tokens_count)]
             label_ids = label_ids[: (max_seq_length - special_tokens_count)]
 
-        # The convention in BERT is:
-        # (a) For sequence pairs:
-        #  tokens:   [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]
-        #  type_ids:   0   0  0    0    0     0       0   0   1  1  1  1   1   1
-        # (b) For single sequences:
-        #  tokens:   [CLS] the dog is hairy . [SEP]
-        #  type_ids:   0   0   0   0  0     0   0
-        #
-        # Where "type_ids" are used to indicate whether this is the first
-        # sequence or the second sequence. The embedding vectors for `type=0` and
-        # `type=1` were learned during pre-training and are added to the wordpiece
-        # embedding vector (and position vector). This is not *strictly* necessary
-        # since the [SEP] token unambiguously separates the sequences, but it makes
-        # it easier for the model to learn the concept of sequences.
-        #
-        # For classification tasks, the first vector (corresponding to [CLS]) is
-        # used as as the "sentence vector". Note that this only makes sense because
-        # the entire model is fine-tuned.
         tokens += [sep_token]
         label_ids += [label_map['O']]
         segment_ids = [sequence_a_segment_id] * len(tokens)
@@ -143,39 +152,34 @@ def convert_examples_to_features(examples,label_list,max_seq_length,tokenizer,in
         input_ids = tokenizer.convert_tokens_to_ids(tokens)
         # The mask has 1 for real tokens and 0 for padding tokens. Only real
         # tokens are attended to.
-        input_mask = [1 if mask_padding_with_zero else 0] * len(input_ids)
+        input_mask = [1 if mask_padding_with_zero else 0] * len(input_ids) # original mask
         input_len = len(label_ids)
         # Zero-pad up to the sequence length.
         padding_length = max_seq_length - len(input_ids)
-        if pad_on_left:
-            input_ids = ([pad_token] * padding_length) + input_ids
-            input_mask = ([0 if mask_padding_with_zero else 1] * padding_length) + input_mask
-            segment_ids = ([pad_token_segment_id] * padding_length) + segment_ids
-            label_ids = ([pad_token] * padding_length) + label_ids
-        else:
-            input_ids += [pad_token] * padding_length
-            input_mask += [0 if mask_padding_with_zero else 1] * padding_length
-            segment_ids += [pad_token_segment_id] * padding_length
-            label_ids += [pad_token] * padding_length
+        input_ids += [pad_token] * padding_length
+        input_mask += [0 if mask_padding_with_zero else 1] * padding_length  # original mask
+        input_dependency_mask = np.concatenate([input_dependency_mask, np.zeros((padding_length, input_dependency_mask.shape[1]))], axis=0)
+        input_dependency_mask = np.concatenate([input_dependency_mask, np.zeros((input_dependency_mask.shape[0], padding_length))], axis=1)
 
-        assert len(input_ids) == max_seq_length
-        assert len(input_mask) == max_seq_length
-        assert len(segment_ids) == max_seq_length
-        assert len(label_ids) == max_seq_length
-        if ex_index < 5:
+        segment_ids += [pad_token_segment_id] * padding_length
+        label_ids += [pad_token] * padding_length
+
+        decode_mask = [(x != label_map["X"]) for x in label_ids]
+
+        if ex_index < 2:
             logger.info("*** Example ***")
             logger.info("guid: %s", example.guid)
             logger.info("tokens: %s", " ".join([str(x) for x in tokens]))
             logger.info("input_ids: %s", " ".join([str(x) for x in input_ids]))
             logger.info("input_mask: %s", " ".join([str(x) for x in input_mask]))
+            logger.info("decoder_mask: %s", " ".join([str(x) for x in decode_mask]))
             logger.info("segment_ids: %s", " ".join([str(x) for x in segment_ids]))
             logger.info("label_ids: %s", " ".join([str(x) for x in label_ids]))
-
-        features.append(InputFeatures(input_ids=input_ids, input_mask=input_mask,input_len = input_len,
-                                      segment_ids=segment_ids, label_ids=label_ids))
+        features.append(InputFeatures(input_ids=input_ids, input_mask=input_mask, input_dependency_mask=input_dependency_mask,
+                                      input_len = input_len, decode_mask = decode_mask, segment_ids=segment_ids, label_ids=label_ids))
     return features
 
-class CluenerProcessor(DataProcessor):
+class DNRTIBIOProcessor(DataProcessor):
     """Processor for the chinese ner data set."""
 
     def get_train_examples(self, data_dir):
@@ -184,7 +188,7 @@ class CluenerProcessor(DataProcessor):
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(self._read_text(os.path.join(data_dir, "dev.txt")), "dev")
+        return self._create_examples(self._read_text(os.path.join(data_dir, "valid.txt")), "dev")
 
     def get_test_examples(self, data_dir):
         """See base class."""
@@ -192,12 +196,10 @@ class CluenerProcessor(DataProcessor):
 
     def get_labels(self):
         """See base class."""
-        return ["X", "B-address", "B-book", "B-company", 'B-game', 'B-government', 'B-movie', 'B-name',
-                'B-organization', 'B-position','B-scene',"I-address",
-                "I-book", "I-company", 'I-game', 'I-government', 'I-movie', 'I-name',
-                'I-organization', 'I-position','I-scene',
-                'O',"[START]", "[END]"]
-
+        return ["X", "B-HackOrg", "I-HackOrg", "B-OffAct", "I-OffAct", "B-SamFile", "I-SamFile",
+                "B-SecTeam", "I-SecTeam", "B-Time", "I-Time", "B-Way", "I-Way", "B-Tool", "I-Tool",
+                "B-Idus", "I-Idus", "B-Org", "I-Org", "B-Area", "I-Area", "B-Purp", "I-Purp",
+                "B-Exp", "I-Exp", "B-Features", "I-Features", 'O',"[START]", "[END]"]
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
@@ -208,11 +210,12 @@ class CluenerProcessor(DataProcessor):
             # BIOS
             labels = []
             for x in line['labels']:
+
                 labels.append(x)
             examples.append(InputExample(guid=guid, text_a=text_a, labels=labels))
         return examples
 
-class ResumeProcessor(DataProcessor):
+class DNRTIBIEOSProcessor(DataProcessor):
     """Processor for the chinese ner data set."""
 
     def get_train_examples(self, data_dir):
@@ -221,7 +224,7 @@ class ResumeProcessor(DataProcessor):
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(self._read_text(os.path.join(data_dir, "dev.txt")), "dev")
+        return self._create_examples(self._read_text(os.path.join(data_dir, "valid.txt")), "dev")
 
     def get_test_examples(self, data_dir):
         """See base class."""
@@ -229,8 +232,20 @@ class ResumeProcessor(DataProcessor):
 
     def get_labels(self):
         """See base class."""
-        return ["X",'B-CONT','B-EDU','B-LOC','B-NAME','B-ORG','B-PRO','B-RACE','B-TITLE',
-                'I-CONT','I-EDU','I-LOC','I-NAME','I-ORG','I-PRO','I-RACE','I-TITLE',
+
+        return ["X", "B-HackOrg", "I-HackOrg", "E-HackOrg", "S-HackOrg",
+                "B-OffAct", "I-OffAct", "E-OffAct", "S-OffAct",
+                "B-SamFile", "I-SamFile", "E-SamFile", "S-SamFile",
+                "B-SecTeam", "I-SecTeam", "E-SecTeam", "S-SecTeam",
+                "B-Time", "I-Time", "E-Time", "S-Time",
+                "B-Way", "I-Way", "E-Way", "S-Way",
+                "B-Tool", "I-Tool", "E-Tool", "S-Tool",
+                "B-Idus", "I-Idus", "E-Idus", "S-Idus",
+                "B-Org", "I-Org", "E-Org", "S-Org",
+                "B-Area", "I-Area", "E-Area", "S-Area",
+                "B-Purp", "I-Purp", "E-Purp", "S-Purp",
+                "B-Exp", "I-Exp", "E-Exp", "S-Exp",
+                "B-Features", "I-Features", "E-Features", "S-Features",
                 'O',"[START]", "[END]"]
 
     def _create_examples(self, lines, set_type):
@@ -239,170 +254,20 @@ class ResumeProcessor(DataProcessor):
         for (i, line) in enumerate(lines):
             guid = "%s-%s" % (set_type, i)
             text_a= line['words']
-            # BIOS
+            # BIEOS
             labels = []
-            for x in line['labels']:
-                if 'M-' in x:
-                    labels.append(x.replace('M-','I-'))
-                elif 'E-' in x:
-                    labels.append(x.replace('E-', 'I-'))
-                else:
-                    labels.append(x)
-            examples.append(InputExample(guid=guid, text_a=text_a, labels=labels))
-        return examples
-
-class MSRAProcessor(DataProcessor):
-    """Processor for the chinese ner data set."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(self._read_text(os.path.join(data_dir, "train.txt")), "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(self._read_text(os.path.join(data_dir, "dev.txt")), "dev")
-
-    def get_test_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(self._read_text(os.path.join(data_dir, "test.txt")), "test")
-
-    def get_labels(self):
-        """See base class."""
-        return ["X",'B-LOC','B-ORG','B-PER','I-LOC','I-ORG','I-PER','O',"[START]", "[END]"]
-
-    def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
-        examples = []
-        for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, i)
-            text_a= line['words']
-            # BIOS
-            labels = []
-            for x in line['labels']:
-                if 'M-' in x:
-                    labels.append(x.replace('M-','I-'))
-                elif 'E-' in x:
-                    labels.append(x.replace('E-', 'I-'))
-                else:
-                    labels.append(x)
-            examples.append(InputExample(guid=guid, text_a=text_a, labels=labels))
-        return examples
-
-class WeiboProcessor(DataProcessor):
-    """Processor for the chinese ner data set."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(self._read_text(os.path.join(data_dir, "train.txt")), "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(self._read_text(os.path.join(data_dir, "dev.txt")), "dev")
-
-    def get_test_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(self._read_text(os.path.join(data_dir, "test.txt")), "test")
-
-    def get_labels(self):
-        """See base class."""
-        return ["X",'B-PER.NOM','B-LOC.NAM','B-PER.NAM','B-GPE.NAM','B-ORG.NAM','B-ORG.NOM','B-LOC.NOM','B-GPE.NOM',
-                'I-PER.NOM','I-LOC.NAM','I-PER.NAM','I-GPE.NAM','I-ORG.NAM','I-ORG.NOM','I-LOC.NOM','I-GPE.NOM',
-                'O',"[START]", "[END]"]
-
-    def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
-        examples = []
-        for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, i)
-            text_a= line['words']
-            # BIOS
-            labels = []
-            for x in line['labels']:
-                labels.append(x)
-            examples.append(InputExample(guid=guid, text_a=text_a, labels=labels))
-        return examples
-
-class CoNLLProcessor(DataProcessor):
-    """Processor for the chinese ner data set."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(self._read_text(os.path.join(data_dir, "train.txt")), "train")
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(self._read_text(os.path.join(data_dir, "dev.txt")), "dev")
-
-    def get_test_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(self._read_text_(os.path.join(data_dir, "test.txt")), "test")
-
-    def get_labels(self):
-        """See base class."""
-        return ["X",'B-MethodName','B-HyperparameterName','B-HyperparameterValue','B-MetricName','B-MetricValue','B-TaskName','B-DatasetName',
-                'I-MethodName','I-HyperparameterName','I-HyperparameterValue','I-MetricName','I-MetricValue','I-TaskName','I-DatasetName',
-                'O',"[START]", "[END]"]
-
-    def _read_text_for_lines(self,input_file):
-        lines = []
-        with open(input_file,'r') as f:
-            for line in f:
-                words = line.split(" ")
-                labels = ["O"] * len(words)
-                lines.append({"words": words, "labels": labels})
-        return lines
-
-    def _read_text_(self,input_file):
-        lines = []
-        with open(input_file,'r') as f:
-            words = []
-            labels = []
-            for line in f:
-                if line.startswith("-DOCSTART-") or line == "" or line == "\n":
-                    if words:
-                        if len(words) > 400:
-                            lines.append({"words": words[:400] + ["TO_BE_CONTINUE"], "labels": labels[:400] + ["O"]})
-                            lines.append({"words": words[400:], "labels": labels[400:]})
-                        else:
-                            lines.append({"words":words,"labels":labels})
-                        words = []
-                        labels = []
-                else:
-                    splits = line.split("\t")
-                    words.append(splits[0])
-                    if len(splits) > 1:
-                        label = splits[-1].replace("\n", "")
-                        if label.startswith("E") or label.startswith("M"):
-                            label = "I-" + label.split("-")[-1]
-                        labels.append(label)
-                    else:
-                        # Examples could have no label for mode = "test"
-                        labels.append("O")
-            if words:
-                if len(words) > 400:
-                    lines.append({"words": words[:400] + ["TO_BE_CONTINUE"], "labels": labels[:400] + ["O"]})
-                    lines.append({"words": words[400:], "labels": labels[400:]})
-                else:
-                    lines.append({"words": words, "labels": labels})
-        return lines
-
-    def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
-        examples = []
-        for (i, line) in enumerate(lines):
-            guid = "%s-%s" % (set_type, i)
-            text_a= line['words']
-            # BIOS
-            labels = []
-            for x in line['labels']:
+            for idx, x in enumerate(line['labels']):
+                if x.startswith("B-"):
+                    if(idx == len(line['labels']) - 1) or (idx+1 < len(line['labels']) and line['labels'][idx+1] != "I-" + x.split("-")[-1]):
+                        x = x.replace("B-", "S-")
+                elif x.startswith("I-"):
+                    if(idx == len(line['labels']) - 1) or (idx+1 < len(line['labels']) and line['labels'][idx+1] != x):
+                        x = x.replace("I-", "E-")
                 labels.append(x)
             examples.append(InputExample(guid=guid, text_a=text_a, labels=labels))
         return examples
 
 ner_processors = {
-    'cluener':CluenerProcessor,
-    'resume':ResumeProcessor,
-    'msra':MSRAProcessor,
-    'weibo':WeiboProcessor,
-    'conll':CoNLLProcessor
+    'dnrti_bio':DNRTIBIOProcessor,
+    'dnrti_bieos':DNRTIBIEOSProcessor,
 }

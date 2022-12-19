@@ -2,96 +2,89 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .layers.crf import CRF
-from .layers.cnn import IDCNN
+from .layers.attention import BertSelfAttention
 from .layers.bilstm import BILSTM
 from transformers import BertModel,BertPreTrainedModel
-from typing import List, Optional
-from .layers.linears import PoolerEndLogits, PoolerStartLogits
-from torch.nn import CrossEntropyLoss
-from losses.focal_loss import FocalLoss
-from losses.label_smoothing import LabelSmoothingCrossEntropy
 
 class BertCrfForNer(BertPreTrainedModel):
     def __init__(self, config):
         super(BertCrfForNer, self).__init__(config)
         self.bert = BertModel(config)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.lambda_score = 0.8
+
+        # self.dependency_mask_attention = BertSelfAttention(config)
+
+        #Context Aggregation Feature
+        self.lambda_concat_layer = nn.Linear(config.hidden_size * 2, config.hidden_size)
+        self.lambda_score_layer = nn.Linear(config.hidden_size, 1, )
+
+        self.dropout_bert = nn.Dropout(config.hidden_dropout_prob)
+
+        #one layer bilstm
+        self.bilstm = BILSTM(config.hidden_size // 2, 1, config.hidden_size, config.hidden_dropout_prob, config.num_labels, True)
+        
+        #Global self-attention
+        self.attention_layer = nn.Linear(config.hidden_size, config.hidden_size)
+        self.attention_ut = nn.Parameter(torch.Tensor(config.hidden_size, 1))
+        self.attention_ut.data.normal_(mean=0.0, std=self.config.initializer_range)
+        self.attention_z = nn.Linear(config.hidden_size * 2, config.hidden_size)
+
+        self.dropout_lstm = nn.Dropout(config.hidden_dropout_prob)
+
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         self.crf = CRF(num_tags=config.num_labels, batch_first=True)
         self.init_weights()
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None,labels=None):
-        outputs =self.bert(input_ids = input_ids,attention_mask=attention_mask,token_type_ids=token_type_ids)
-        sequence_output = outputs[0]
-        sequence_output = self.dropout(sequence_output)
-        logits = self.classifier(sequence_output)
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, dependency_mask=None, labels=None):
+        original_outputs =self.bert(input_ids=input_ids,attention_mask=attention_mask, token_type_ids=token_type_ids)[0]
+        dependency_outputs = self.bert(input_ids=input_ids,attention_mask=dependency_mask, token_type_ids=token_type_ids)[0]
+
+
+        # Context Aggregation Feature
+        # outputs = torch.cat([original_outputs, dependency_outputs], axis=-1)
+        #
+        # lambda_ = self.lambda_concat_layer(outputs)
+        # lambda_ = self.lambda_score_layer(lambda_)
+        # lambda_score = torch.sigmoid(lambda_)
+        #
+        sequence_output = self.lambda_score * original_outputs + (1-self.lambda_score) * dependency_outputs
+        # sequence_output = original_outputs
+        sequence_output = self.dropout_bert(sequence_output)
+
+        #bilstm
+        sequence_bilstm_output = self.bilstm(sequence_output) #(bs, seq_len, hidden_size)
+        sequence_bilstm_output = self.dropout_lstm(sequence_bilstm_output)
+
+        #Global self-attention ui
+        attention_ui = torch.tanh(self.attention_layer(sequence_bilstm_output)) # (bs, seq_len, seq_len)
+        attention_alpha = torch.einsum('bmd,dn->bmn',attention_ui, self.attention_ut)  # (bs, seq_len, 1)
+        attention_alpha = torch.squeeze(attention_alpha, -1) # (bs, seq_len)
+        attention_alpha = F.softmax(attention_alpha)
+        attention_alpha = torch.unsqueeze(attention_alpha, 2) # (bs, seq_len, 1)
+        attention_output = torch.sum(attention_alpha * sequence_bilstm_output, dim=1, keepdim=True)# (bs, 1, hidden_size)
+        attention_output = torch.tile(attention_output, [1, sequence_bilstm_output.shape[1], 1])# (bs, seq_len, hidden_size)
+        sequence_attention_output = torch.cat([attention_output, sequence_bilstm_output], axis=-1)
+        sequence_attention_output = self.attention_z(sequence_attention_output) # (bs, seq_len, hidden_size)
+        sequence_attention_output = torch.tanh(sequence_attention_output)
+
+        logits = self.classifier(sequence_attention_output) #(bs, seq_len, num_labels)
         outputs = (logits,)
         if labels is not None:
             loss = self.crf(emissions = logits, tags=labels, mask=attention_mask)
             outputs =(-1*loss,)+outputs
         return outputs # (loss), scores
 
-class IDCNNCrfForNer(BertPreTrainedModel):
-    def __init__(self, config):
-        super(IDCNNCrfForNer, self).__init__(config)
-        word_embedding_dim = config.hidden_size
-        self.embedding = Embeddings(config)
-        # self.embedding = nn.Embedding(config.vocab_size, word_embedding_dim, name="embeddings.word_embeddings")
-        self.idcnn = IDCNN(input_size=word_embedding_dim, seq_len=128, filters=300)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Linear(300, config.num_labels)
-        self.crf = CRF(num_tags=config.num_labels, batch_first=True)
-        self.init_weights()
+    def decode(self, logits, attention_mask, decode_mask):
+        viterbi_path = self.crf.decode(logits, attention_mask)
+        viterbi_tags = viterbi_path.squeeze(0).cpu().numpy()
+        decode_tags = []
+        for i in range(viterbi_tags.shape[0]):
+            decode_tag = []
+            for j in range(viterbi_tags.shape[1]):
+                if decode_mask[i, j]:
+                    decode_tag.append(viterbi_tags[i, j])
+            decode_tags.append(decode_tag[1:-1])
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None,labels=None):
-        embeddings = self.embedding(input_ids)
-        # embeddings = self.dropout(embeddings)
-        sequence_output = self.idcnn(embeddings)
-        sequence_output = self.dropout(sequence_output)
-        logits = self.classifier(sequence_output)
-        outputs = (logits,)
-        if labels is not None:
-            loss = self.crf(emissions = logits, tags=labels, mask=attention_mask)
-            outputs =(-1*loss,)+outputs
-        return outputs # (loss), scores
+        return decode_tags
 
-class BilstmCrfForNer(BertPreTrainedModel):
-    def __init__(self, config):
-        super(BilstmCrfForNer, self).__init__(config)
-        word_embedding_dim = config.hidden_size
-        self.embedding = Embeddings(config)
-        self.lstm = BILSTM(300, 2, word_embedding_dim, config.hidden_dropout_prob, config.num_labels, True)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Linear(300 * 2, config.num_labels)
-        self.crf = CRF(num_tags=config.num_labels, batch_first=True)
-        self.init_weights()
-
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None):
-        embeddings = self.embedding(input_ids)
-        # embeddings = self.dropout(embeddings)
-        sequence_output = self.lstm(embeddings)
-        sequence_output = self.dropout(sequence_output)
-        logits = self.classifier(sequence_output)
-        outputs = (logits,)
-        if labels is not None:
-            loss = self.crf(emissions = logits, tags=labels, mask=attention_mask)
-            outputs =(-1*loss,)+outputs
-        return outputs # (loss), scores
-
-
-class Embeddings(nn.Module):
-    """Construct the embeddings from word, position and token_type embeddings."""
-    def __init__(self, config):
-        super().__init__()
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def forward(self, input_ids: Optional[torch.LongTensor] = None) -> torch.Tensor:
-        inputs_embeds = self.word_embeddings(input_ids)
-        embeddings = self.LayerNorm(inputs_embeds)
-        embeddings = self.dropout(embeddings)
-        return embeddings
 

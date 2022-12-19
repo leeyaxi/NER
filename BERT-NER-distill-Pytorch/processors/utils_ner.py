@@ -2,6 +2,8 @@ import csv
 import json
 import torch
 import unicodedata
+import numpy as np
+from itertools import chain
 from transformers import BertTokenizer
 
 class DataProcessor(object):
@@ -42,12 +44,10 @@ class DataProcessor(object):
                         words = []
                         labels = []
                 else:
-                    splits = line.split(" ")
+                    splits = line.strip().split(" ")
                     words.append(splits[0])
                     if len(splits) > 1:
                         label = splits[-1].replace("\n", "")
-                        if label.startswith("E") or label.startswith("M"):
-                            label = "I-" + label.split("-")[-1]
                         labels.append(label)
                     else:
                         # Examples could have no label for mode = "test"
@@ -254,4 +254,45 @@ def bert_extract_item(start_logits, end_logits):
             if s_l == e_l:
                 S.append((s_l, i, i + j))
                 break
-    return S
+    return
+
+class parserDenpendencyTree():
+    def __init__(self):
+        self.total_path = []
+    def find_tree_path(self, dependency_graph, idx, path):
+        # path.append((idx, dependency_graph.nodes[idx]["word"]))
+        path.append(idx-1)
+        if len(dependency_graph.nodes[idx]["deps"]) == 0:
+            self.total_path.append([item for item in path[1:]])
+            return
+        next_idx_ls = []
+        for child_idx in dependency_graph.nodes[idx]["deps"].values():
+            next_idx_ls.extend(child_idx)
+        for next_idx in next_idx_ls:
+            self.find_tree_path(dependency_graph, next_idx, path)
+            path.pop(-1)
+        return
+
+    def get_total_path(self):
+        return self.total_path
+
+    def get_visual_mask(self, position_mapping_dic, seq_len, max_seq_length):
+        visual_mask = np.zeros((seq_len, seq_len))
+        for abs_path in self.total_path:
+            rel_path = [position_mapping_dic[abs_pos] for abs_pos in abs_path]
+            # relavance_path = list(chain(*rel_path))
+            # for node in relavance_path:
+            #     visual_mask[node, relavance_path] = 1
+            for idx, relnode_pos_ls in enumerate(rel_path):
+                for relnode_pos in relnode_pos_ls:
+                    visual_mask[relnode_pos, list(chain(*rel_path[idx:]))] = 1
+        if seq_len > max_seq_length:
+            visual_mask = visual_mask[:max_seq_length, :max_seq_length]
+
+        #add cls and sep
+        visual_mask = np.concatenate([np.ones((1, visual_mask.shape[1])), visual_mask], axis=0)
+        visual_mask = np.concatenate([visual_mask, np.ones((1, visual_mask.shape[1]))], axis=0)
+        visual_mask = np.concatenate([np.ones((visual_mask.shape[0], 1)), visual_mask], axis=1)
+        visual_mask = np.concatenate([visual_mask, np.ones((visual_mask.shape[0], 1))], axis=1)
+
+        return visual_mask
