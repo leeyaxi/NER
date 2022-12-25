@@ -72,23 +72,41 @@
 
 ### 配置参数说明
   --model_type=bert #模型名称, 这里不用修改
+
   --model_name_or_path=$BERT_BASE_DIR #bert初始化模型路径, 可自行去huggface上下载对应语种的model
+
   --task_name=$TASK_NAME #任务名称, 可配置'**mooc**', 可自行增加task数据处理类
+
   --do_train #是否训练, 训练会包含验证过程, 每一轮会打印验证集效果并保存f1 best model
+
   --do_predict  #是否测试, 调用测试集测试
+
   --do_lower_case #文本大小写, 与根据初始化模型里的tokenizer配置保持一致
+
   --data_dir=$DATA_DIR/${TASK_NAME} #数据集路径名称
+
   --train_max_seq_length=128 #训练的max sequence length
+
   --eval_max_seq_length=128 #测试的max sequence length
+
   --per_gpu_train_batch_size=64 #训练的batch size
+
   --per_gpu_eval_batch_size=64  #测试的batch size
+
   --learning_rate=1e-5 #model学习率
+
   --crf_learning_rate=1e-3 #crf层学习率, 与model分开(仅在方面词提取阶段使用)
+
   --num_train_epochs=10  #训练轮次
+
   --logging_steps=-1 #日志等级, 不要修改
+
   --save_steps=-1 #每一轮训练途中是否调用验证过程, 不要修改
+
   --output_dir=$OUTPUR_DIR/${TASK_NAME}/ #model以及预测结果输出路径
+
   --overwrite_output_dir #是否需要覆盖输出路径
+
   --seed=42 #随机种子数
 
 ### 运行代码
