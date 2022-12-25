@@ -343,8 +343,7 @@ def predict(args, model, tokenizer):
 
     # Save predictions
     write_predictions(
-        # os.path.join(args.data_dir, "mooc.test.txt.atepc"),
-        os.path.join(args.data_dir, "test.iob"),
+        os.path.join(args.data_dir, "mooc.test.txt.atepc"),
         os.path.join(args.output_dir, "test_predictions.txt"),
         [[args.id2label[x] for x in seq] for seq in all_pred_id_ls]
     )
