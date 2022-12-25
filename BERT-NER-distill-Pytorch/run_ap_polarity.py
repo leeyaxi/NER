@@ -18,29 +18,41 @@ from tools.common import init_logger, logger
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data.dataset import Dataset
 from transformers import WEIGHTS_NAME, BertConfig,get_linear_schedule_with_warmup,AdamW, BertTokenizer
-from models.bert_for_ner import BertCrfForNer
-from processors.utils_ner import get_entities, get_conll_out_format
-from processors.ner_seq import convert_examples_to_features
-from processors.ner_seq import ner_processors as processors
-from processors.ner_seq import collate_fn
-from metrics.ner_metrics import SeqEntityScore
+from models.MFSGC import MFSGC
+from processors.ape_seq import convert_examples_to_features
+from processors.ape_seq import ner_processors as processors
+from processors.ape_seq import collate_fn
+from processors.utils_ner import EmotionEntityLib
 from tools.finetuning_argparse import get_argparse
-from losses.ce_loss import CELoss, KLLoss
 MODEL_CLASSES = {
     ## bert ernie bert_wwm bert_wwwm_ext
-    'bert': (BertConfig, BertCrfForNer, BertTokenizer),
+    'mfsgc': (BertConfig, MFSGC, BertTokenizer),
 }
 
 from seqeval.metrics import f1_score, precision_score, recall_score, classification_report
+from sklearn import metrics
 
-def compute_metrics(predictions, label_ids, label_map):
-    label_list = [[label_map[x] for x in seq] for seq in label_ids]
-    preds_list = [[label_map[x]  if label_map[x] != "X" else "O" for x in seq] for seq in predictions]
+def compute_metrics(predictions, label_ids, ap_flag_id_ls, ap_class_map, label_map):
+    label_list = [["-"+label_map[x] for j, x in enumerate(seq) if ap_flag_id_ls[i][j] != ap_class_map['O']] for i, seq in enumerate(label_ids)]
+    preds_list = [["-"+label_map[x] for j, x in enumerate(seq) if ap_flag_id_ls[i][j] != ap_class_map['O']] for i, seq in enumerate(predictions)]
     class_info = classification_report(label_list, preds_list, digits=4, output_dict=True)
     return {
         "precision": precision_score(label_list, preds_list),
         "recall": recall_score(label_list, preds_list),
         "f1": f1_score(label_list, preds_list),
+    }, class_info
+
+def compute_metrics(predictions, label_ids, label_map):
+    label_list = [label_map[seq] for seq in label_ids]
+    preds_list = [label_map[seq] for seq in predictions]
+    class_info = metrics.classification_report(label_list, preds_list, digits=4, output_dict=True)
+    acc = class_info["accuracy"]
+    del class_info["accuracy"]
+    return {
+        "accuracy": acc,
+        "precision": metrics.precision_score(label_list, preds_list, average="macro"),
+        "recall": metrics.recall_score(label_list, preds_list, average="macro"),
+        "f1": metrics.f1_score(label_list, preds_list, average="macro"),
     }, class_info
 
 
@@ -59,8 +71,14 @@ def write_predictions(input_file, output_file, predictions):
                     example_id += 1
             elif len(predictions) > example_id:
                 cols = line.rstrip().split()
+                # 非方面词无需预测polarity
+                if cols[1] == "O":
+                    cols.append("-100")
+                    writer.write("\t".join(cols) + "\n")
+                    continue
+
                 if len(predictions[example_id]) == 0:
-                    cols.append("O")
+                    cols.append("-100")
                 else:
                     if type(predictions[example_id][0]) == list:
                         if len(predictions[example_id][0]) == 0:
@@ -91,26 +109,23 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
         t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ["bias", "LayerNorm.weight"]
-    crf_param_optimizer = list(model.crf.named_parameters())
-    linear_param_optimizer = list(model.classifier.named_parameters())
-    bert_param_optimizer = [item for item in list(model.named_parameters()) \
-                            if not item[0].startswith("crf")  and not item[0].startswith("classifier")]
     optimizer_grouped_parameters = [
-        {'params': [p for n, p in bert_param_optimizer if not any(nd in n for nd in no_decay)],
-         'weight_decay': args.weight_decay, 'lr': args.learning_rate},
-        {'params': [p for n, p in bert_param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0,
-         'lr': args.learning_rate},
-
-        {'params': [p for n, p in crf_param_optimizer if not any(nd in n for nd in no_decay)],
-         'weight_decay': args.weight_decay, 'lr': args.crf_learning_rate},
-        {'params': [p for n, p in crf_param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0,
-         'lr': args.crf_learning_rate},
-
-        {'params': [p for n, p in linear_param_optimizer if not any(nd in n for nd in no_decay)],
-         'weight_decay': args.weight_decay, 'lr': args.crf_learning_rate},
-        {'params': [p for n, p in linear_param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0,
-         'lr': args.crf_learning_rate}
+        {
+            "params": [
+                p for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [
+                p for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": 0.0,
+        },
     ]
+
     args.warmup_steps = int(t_total * args.warmup_proportion)
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
@@ -179,10 +194,9 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                 continue
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
-            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "dependency_mask":batch[3], "labels": batch[4]}
-            if args.model_type != "distilbert":
-                # XLM and RoBERTa don"t use segment_ids
-                inputs["token_type_ids"] = (batch[2] if args.model_type in ["bert", "xlnet"] else None)
+            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "token_type_ids": batch[2], "input_multi_fusion_adjacency_matrix":batch[3],
+                      "input_emotion_samples": batch[7], "input_pos_weight_q":batch[8], "ap_polarity_labels": batch[6],
+                      "ap_class_labels": batch[5]}
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
             #student model need add loss function like Lseq-fuzzy
@@ -250,6 +264,7 @@ def evaluate(args, model, eval_dataset, prefix):
     nb_eval_steps = 0
     all_pred_id_ls = []
     all_label_id_ls = []
+    ap_flag_id_ls = []
     pbar = ProgressBar(n_total=len(eval_dataloader), desc="Evaluating")
     if isinstance(model, nn.DataParallel):
         model = model.module
@@ -257,34 +272,36 @@ def evaluate(args, model, eval_dataset, prefix):
         model.eval()
         batch = tuple(t.to(args.device) for t in batch)
         with torch.no_grad():
-            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "dependency_mask":batch[3], "labels": batch[4]}
-            if args.model_type != "distilbert":
-                # XLM and RoBERTa don"t use segment_ids
-                inputs["token_type_ids"] = (batch[2] if args.model_type in ["bert", "xlnet"] else None)
+            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "token_type_ids": batch[2], "input_multi_fusion_adjacency_matrix":batch[3],
+                      "input_emotion_samples": batch[7], "input_pos_weight_q":batch[8], "ap_polarity_labels": batch[6],
+                      "ap_class_labels": batch[5]}
             outputs = model(**inputs)
             tmp_eval_loss, logits = outputs[:2]
-            tags = model.decode(logits, inputs['attention_mask'], batch[-1])
+            # tags = model.decode(logits, batch[-1])
+            tags=torch.argmax(logits, dim=1).cpu().numpy()
         if args.n_gpu > 1:
             tmp_eval_loss = tmp_eval_loss.mean()  # mean() to average on multi-gpu parallel evaluating
         eval_loss += tmp_eval_loss.item()
         nb_eval_steps += 1
-        out_label_ids = inputs['labels'].cpu().numpy()
-        out_label_ids = [[out_label_ids[i, j] for j in range(out_label_ids.shape[1]) if batch[-1][i, j] == 1][1:-1] for i in range(out_label_ids.shape[0])]
+        out_label_ids = inputs['ap_polarity_labels'].cpu().numpy()
+        # out_label_ids = [[out_label_ids[i, j] for j in range(out_label_ids.shape[1]) if batch[-1][i, j] == 1] for i in range(out_label_ids.shape[0])]
         all_label_id_ls.extend(out_label_ids)
         all_pred_id_ls.extend(tags)
+        # # 仅对aspect位置的polarity进行计算
+        # ap_flag_id_ls.extend([[word for word in seq if word != -100] for seq in batch[5].numpy()])
         pbar(step)
 
     assert len(all_label_id_ls) == len(all_pred_id_ls)
-    assert len(all_label_id_ls[0]) == len(all_label_id_ls[0])
+    # assert len(all_label_id_ls[0]) == len(all_label_id_ls[0])
 
     eval_metric, entity_metric = compute_metrics(all_pred_id_ls, all_label_id_ls, args.id2label)
 
-    # Save predictions
-    write_predictions(
-        os.path.join(args.data_dir, "valid.txt"),
-        os.path.join(args.output_dir, "eval_predictions.txt"),
-        [[args.id2label[x] for x in seq] for seq in all_pred_id_ls]
-    )
+    # # Save predictions
+    # write_predictions(
+    #     os.path.join(args.data_dir, "valid.txt"),
+    #     os.path.join(args.output_dir, "eval_predictions.txt"),
+    #     [[args.id2label[x] for x in seq] for seq in all_pred_id_ls]
+    # )
 
     logger.info("\n")
     eval_loss = eval_loss / nb_eval_steps
@@ -301,11 +318,11 @@ def evaluate(args, model, eval_dataset, prefix):
     return results
 
 
-def predict(args, model, tokenizer):
+def predict(args, model, tokenizer, emotionEntLib):
     pred_output_dir = args.output_dir
     if not os.path.exists(pred_output_dir) and args.local_rank in [-1, 0]:
         os.makedirs(pred_output_dir)
-    test_dataset = load_and_cache_examples(args, args.task_name, tokenizer, data_type='test')
+    test_dataset = load_and_cache_examples(args, args.task_name, tokenizer, emotionEntLib, data_type='test')
     # Note that DistributedSampler samples randomly
     test_sampler = SequentialSampler(test_dataset) if args.local_rank == -1 else DistributedSampler(test_dataset)
     test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=1, collate_fn=collate_fn)
@@ -325,34 +342,36 @@ def predict(args, model, tokenizer):
         model.eval()
         batch = tuple(t.to(args.device) for t in batch)
         with torch.no_grad():
-            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "dependency_mask":batch[3], "labels": batch[4]}
-            if args.model_type != "distilbert":
-                # XLM and RoBERTa don"t use segment_ids
-                inputs["token_type_ids"] = (batch[2] if args.model_type in ["bert", "xlnet"] else None)
+            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "token_type_ids": batch[2], "input_multi_fusion_adjacency_matrix":batch[3],
+                      "input_emotion_samples": batch[7], "input_pos_weight_q":batch[8], "ap_polarity_labels": batch[6],
+                      "ap_class_labels": batch[5]}
             outputs = model(**inputs)
             tmp_eval_loss, logits = outputs[:2]
-            tags = model.decode(logits, inputs['attention_mask'], batch[-1])
+            # tags = model.decode(logits, batch[-1])
+            tags = torch.argmax(logits, dim=1).cpu().numpy()
         if args.n_gpu > 1:
             tmp_eval_loss = tmp_eval_loss.mean()  # mean() to average on multi-gpu parallel evaluating
         pred_loss += tmp_eval_loss.item()
         nb_pred_steps += 1
-        out_label_ids = inputs['labels'].cpu().numpy()
-        out_label_ids = [[out_label_ids[i, j] for j in range(out_label_ids.shape[1]) if batch[-1][i, j] == 1][1:-1] for i in range(out_label_ids.shape[0])]
+        out_label_ids = inputs['ap_polarity_labels'].cpu().numpy()
+        # out_label_ids = [[out_label_ids[i, j] for j in range(out_label_ids.shape[1]) if batch[-1][i, j] == 1] for i in range(out_label_ids.shape[0])]
         all_label_id_ls.extend(out_label_ids)
         all_pred_id_ls.extend(tags)
+        # # 仅对aspect位置的polarity进行计算
+        # ap_flag_id_ls.extend([[word for word in seq if word != -100] for seq in batch[5].numpy()])
         pbar(step)
 
     assert len(all_label_id_ls) == len(all_pred_id_ls)
-    assert len(all_label_id_ls[0]) == len(all_label_id_ls[0])
+    # assert len(all_label_id_ls[0]) == len(all_label_id_ls[0])
 
     eval_metric, entity_metric = compute_metrics(all_pred_id_ls, all_label_id_ls, args.id2label)
 
     # Save predictions
-    write_predictions(
-        os.path.join(args.data_dir, "test.txt"),
-        os.path.join(args.output_dir, "test_predictions.txt"),
-        [[args.id2label[x] for x in seq] for seq in all_pred_id_ls]
-    )
+    # write_predictions(
+    #     os.path.join(args.data_dir, "mooc.test.txt.atepc"),
+    #     os.path.join(args.output_dir, "test_predictions.txt"),
+    #     [[args.id2label[x] for x in seq] for seq in all_pred_id_ls]
+    # )
 
     logger.info("\n")
     pred_loss = pred_loss / nb_pred_steps
@@ -367,14 +386,14 @@ def predict(args, model, tokenizer):
         info = "-".join([f' {key}: {value:.4f} ' for key, value in entity_metric[key].items()])
         logger.info(info)
 
-def load_and_cache_examples(args, task, tokenizer, data_type='train'):
+def load_and_cache_examples(args, task, tokenizer, emotionEntLib, data_type='train'):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
     processor = processors[task]()
     # Load data features from cache or dataset file
-    cached_features_file = os.path.join(args.data_dir, 'cached_crf-{}_{}_{}_{}'.format(
+    cached_features_file = os.path.join(args.data_dir, 'cached-{}_{}_{}_{}'.format(
         data_type,
-        list(filter(None, args.model_name_or_path.split('/'))).pop(),
+        args.model_type,
         str(args.train_max_seq_length if data_type == 'train' else args.eval_max_seq_length),
         str(task)))
     if os.path.exists(cached_features_file) and not args.overwrite_cache:
@@ -382,7 +401,6 @@ def load_and_cache_examples(args, task, tokenizer, data_type='train'):
         features = torch.load(cached_features_file)
     else:
         logger.info("Creating features from dataset file at %s", args.data_dir)
-        label_list = processor.get_labels()
         if data_type == 'train':
             examples = processor.get_train_examples(args.data_dir)
         elif data_type == 'dev':
@@ -390,9 +408,12 @@ def load_and_cache_examples(args, task, tokenizer, data_type='train'):
         else:
             examples = processor.get_test_examples(args.data_dir)
         features = convert_examples_to_features(examples=examples,
+                                                emotionEntLib=emotionEntLib,
                                                 tokenizer=tokenizer,
                                                 input_type="word",
-                                                label_list=label_list,
+                                                ap_class_list=processor.get_ap_labels(),
+                                                ap_polarity_list=processor.get_ap_polarity(),
+                                                POS_tag_list=processor.get_POS_tag(),
                                                 max_seq_length=args.train_max_seq_length if data_type == 'train' \
                                                     else args.eval_max_seq_length,
                                                 cls_token_at_end=bool(args.model_type in ["xlnet"]),
@@ -412,12 +433,18 @@ def load_and_cache_examples(args, task, tokenizer, data_type='train'):
     # Convert to Tensors and build dataset
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
     all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
-    all_input_dependency_mask = torch.tensor([f.input_dependency_mask for f in features], dtype=torch.long)
-    all_decode_mask = torch.tensor([f.decode_mask for f in features], dtype=torch.long)
     all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
-    all_label_ids = torch.tensor([f.label_ids for f in features], dtype=torch.long)
+    all_multi_fusion_adjacency_matrix = torch.tensor([f.input_multi_fusion_adjacency_matrix for f in features], dtype=torch.float)
+    all_POS_ids = torch.tensor([f.input_POS_ids for f in features], dtype=torch.long)
+    all_pos_weight_q = torch.tensor([f.pos_weight_q for f in features], dtype=torch.float)
+    all_emotion_samples = torch.tensor([f.emotion_samples for f in features], dtype=torch.long)
+    all_decode_mask = torch.tensor([f.decode_mask for f in features], dtype=torch.long)
+    all_ap_class_ids = torch.tensor([f.ap_class_ids for f in features], dtype=torch.long)
+    all_ap_polarity_ids = torch.tensor([f.ap_polarity_ids for f in features], dtype=torch.long)
     all_lens = torch.tensor([f.input_len for f in features], dtype=torch.long)
-    dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_input_dependency_mask, all_lens, all_decode_mask, all_label_ids)
+
+    dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_multi_fusion_adjacency_matrix,
+                            all_lens, all_POS_ids, all_decode_mask, all_emotion_samples, all_pos_weight_q, all_ap_class_ids, all_ap_polarity_ids)
     return dataset
 
 
@@ -476,10 +503,13 @@ def main():
     if args.task_name not in processors:
         raise ValueError("Task not found: %s" % (args.task_name))
     processor = processors[args.task_name]()
-    label_list = processor.get_labels()
+    POS_tag_list = processor.get_POS_tag()
+    # args.POS2id = {label: i+1 for i, label in enumerate(POS_tag_list)}
+    label_list = processor.get_ap_polarity()
     args.id2label = {i: label for i, label in enumerate(label_list)}
     args.label2id = {label: i for i, label in enumerate(label_list)}
     num_labels = len(label_list)
+    emotionEntLib = EmotionEntityLib()
 
     # Load pretrained model and tokenizer
     if args.local_rank not in [-1, 0]:
@@ -490,7 +520,13 @@ def main():
     tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path,
                                                 do_lower_case=args.do_lower_case,)
 
-    model = model_class.from_pretrained(args.model_name_or_path, config=config)
+    config.num_ap_polarities = len(label_list)
+    config.num_POS_tag = len(POS_tag_list) + 1 #需要考虑0id所以+1
+    config.tail_size = emotionEntLib.tail_size
+    config.relation_size = emotionEntLib.relation_size
+    config.word_max_len = emotionEntLib.word_max_len
+    ap_class_map = {label: i for i, label in enumerate(processor.get_ap_labels())}
+    model = model_class.from_pretrained(args.model_name_or_path, config=config, ap_class_map=ap_class_map)
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
@@ -498,17 +534,23 @@ def main():
     logger.info("Training/evaluation parameters %s", args)
     # Training
     if args.do_train:
-        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, data_type='train')
-        eval_dataset = load_and_cache_examples(args, args.task_name, tokenizer, data_type='dev')
+        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, emotionEntLib, data_type='train')
+
+        #切分数据集 8:2
+        train_size = int(0.8 * len(train_dataset))
+        test_size = len(train_dataset) - train_size
+        train_dataset, eval_dataset = torch.utils.data.random_split(train_dataset, [train_size, test_size])
+        # eval_dataset = load_and_cache_examples(args, args.task_name, tokenizer, data_type='dev')
+
         global_step, tr_loss = train(args, train_dataset, eval_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
 
     if args.do_predict and args.local_rank in [-1, 0]:
         tokenizer = tokenizer_class.from_pretrained(os.path.join(args.output_dir, "best"), do_lower_case=args.do_lower_case)
-        model = model_class.from_pretrained(os.path.join(args.output_dir, "best"), config=config)
+        model = model_class.from_pretrained(os.path.join(args.output_dir, "best"), config=config, ap_class_map=ap_class_map)
         model.to(args.device)
-        predict(args, model, tokenizer)
+        predict(args, model, tokenizer, emotionEntLib)
 
 
 if __name__ == "__main__":

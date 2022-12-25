@@ -84,7 +84,7 @@ def get_argparse():
                         help="Overwrite the content of the output directory")
     parser.add_argument("--overwrite_cache", action="store_true",
                         help="Overwrite the cached training and evaluation sets")
-    parser.add_argument("--seed", type=int, deoverwritefault=42, help="random seed for initialization")
+    parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
     parser.add_argument("--fp16", action="store_true",
                         help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit", )
     parser.add_argument("--fp16_opt_level", type=str, default="O1",
